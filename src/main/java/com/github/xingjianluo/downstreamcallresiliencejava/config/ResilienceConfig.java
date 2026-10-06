@@ -2,7 +2,9 @@ package com.github.xingjianluo.downstreamcallresiliencejava.config;
 
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.DownstreamTransport;
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.MockDownstreamServer;
+import com.github.xingjianluo.downstreamcallresiliencejava.fallback.FallbackCacheRegistry;
 import com.github.xingjianluo.downstreamcallresiliencejava.orchestration.Orchestrator;
+import com.github.xingjianluo.downstreamcallresiliencejava.status.ResilienceStatusService;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.CircuitBreakerRegistry;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.FailureRules;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.OperationKind;
@@ -53,7 +55,9 @@ public class ResilienceConfig {
                     Math.max(1, p.getFailureThreshold()),
                     Duration.ofMillis(p.getOpenStateMillis()),
                     Math.max(1, p.getHalfOpenPermits()),
-                    OperationKind.valueOf(p.getOperationKind()));
+                    OperationKind.valueOf(p.getOperationKind()),
+                    Math.max(1, p.getFallbackCapacity()),
+                    Duration.ofMillis(Math.max(0, p.getFallbackTtlMillis())));
         };
     }
 
@@ -73,7 +77,23 @@ public class ResilienceConfig {
     }
 
     @Bean
-    public Orchestrator orchestrator(ResilienceClient client, DownstreamTransport transport) {
-        return new Orchestrator(client, transport);
+    public FallbackCacheRegistry fallbackCacheRegistry(PolicyProvider provider, Clock clock) {
+        return new FallbackCacheRegistry(provider, clock);
+    }
+
+    @Bean
+    public Orchestrator orchestrator(ResilienceClient client, DownstreamTransport transport,
+                                     CircuitBreakerRegistry breakerRegistry,
+                                     FallbackCacheRegistry fallbackRegistry,
+                                     PolicyProvider policyProvider, Clock clock) {
+        return new Orchestrator(client, transport, breakerRegistry,
+                fallbackRegistry, policyProvider, clock);
+    }
+
+    @Bean
+    public ResilienceStatusService resilienceStatusService(CircuitBreakerRegistry breakerRegistry,
+                                                           FallbackCacheRegistry fallbackRegistry,
+                                                           Clock clock) {
+        return new ResilienceStatusService(breakerRegistry, fallbackRegistry, clock);
     }
 }

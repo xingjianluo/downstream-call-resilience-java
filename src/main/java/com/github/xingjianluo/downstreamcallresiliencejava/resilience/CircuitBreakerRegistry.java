@@ -23,4 +23,11 @@ public class CircuitBreakerRegistry {
         return breakers.computeIfAbsent(downstreamName,
                 name -> new CircuitBreaker(name, policyProvider.policyFor(name), clock));
     }
+
+    /**
+     * 当前已知的全部下游熔断器（只读状态查询用）。
+     */
+    public java.util.Collection<CircuitBreaker> all() {
+        return breakers.values();
+    }
 }

@@ -1,9 +1,12 @@
 package com.github.xingjianluo.downstreamcallresiliencejava.tests.support;
 
+import com.github.xingjianluo.downstreamcallresiliencejava.fallback.FallbackCacheRegistry;
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.MockDownstreamServer;
+import com.github.xingjianluo.downstreamcallresiliencejava.orchestration.Orchestrator;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.CircuitBreakerRegistry;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.FailureRules;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.OperationKind;
+import com.github.xingjianluo.downstreamcallresiliencejava.resilience.PolicyProvider;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.ResilienceClient;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.ResiliencePolicy;
 
@@ -13,7 +16,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * 测试装配：为每个下游提供独立策略的弹性客户端与模拟服务器。
+ * 测试装配：为每个下游提供独立策略的弹性客户端、回退缓存与模拟服务器。
  */
 public final class TestFixtures {
 
@@ -27,10 +30,23 @@ public final class TestFixtures {
                 failureThreshold, openState, halfOpenPermits, kind);
     }
 
+    /**
+     * 带显式回退缓存容量与有效期的策略。
+     */
+    public static ResiliencePolicy policyWithFallback(String name, Duration timeout, int maxAttempts,
+                                                      int failureThreshold, Duration openState,
+                                                      int halfOpenPermits, OperationKind kind,
+                                                      int fallbackCapacity, Duration fallbackTtl) {
+        return new ResiliencePolicy(name, timeout, maxAttempts, Duration.ZERO,
+                failureThreshold, openState, halfOpenPermits, kind,
+                fallbackCapacity, fallbackTtl);
+    }
+
     public static final class Harness {
         public final MutableClock clock;
         public final MockDownstreamServer server;
         public final CircuitBreakerRegistry registry;
+        public final FallbackCacheRegistry fallbacks;
         public final ResilienceClient client;
         public final FailureRules rules;
         private final Map<String, ResiliencePolicy> policies = new HashMap<>();
@@ -43,8 +59,10 @@ public final class TestFixtures {
             this.clock = clock;
             this.server = new MockDownstreamServer(clock);
             this.rules = new FailureRules();
-            this.registry = new CircuitBreakerRegistry(
-                    name -> policies.getOrDefault(name, ResiliencePolicy.defaults(name)), clock);
+            PolicyProvider provider = name -> policies.getOrDefault(name,
+                    ResiliencePolicy.defaults(name));
+            this.registry = new CircuitBreakerRegistry(provider, clock);
+            this.fallbacks = new FallbackCacheRegistry(provider, clock);
             this.client = new ResilienceClient(registry, rules);
         }
 
@@ -55,6 +73,14 @@ public final class TestFixtures {
 
         public ResiliencePolicy policyOf(String name) {
             return policies.get(name);
+        }
+
+        /**
+         * 用同一套策略/时钟构造带旧数据回退能力的编排器。
+         */
+        public Orchestrator orchestrator() {
+            return new Orchestrator(client, server.transport(), registry, fallbacks,
+                    name -> policies.getOrDefault(name, ResiliencePolicy.defaults(name)), clock);
         }
     }
 

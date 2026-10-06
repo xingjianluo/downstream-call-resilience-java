@@ -42,6 +42,13 @@ public class ResilienceClient {
         this.executor = executor;
     }
 
+    /**
+     * 熔断器注册表（只读状态查询复用，不改变调用语义）。
+     */
+    public CircuitBreakerRegistry registry() {
+        return registry;
+    }
+
     public <T> CallOutcome<T> execute(String downstreamName, DownstreamCall<T> call) {
         CircuitBreaker breaker = registry.get(downstreamName);
         ResiliencePolicy policy = breaker.policy();

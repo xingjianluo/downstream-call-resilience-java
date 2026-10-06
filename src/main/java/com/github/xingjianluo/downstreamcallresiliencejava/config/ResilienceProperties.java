@@ -29,6 +29,8 @@ public class ResilienceProperties {
         private long openStateMillis = 10_000;
         private int halfOpenPermits = 1;
         private String operationKind = "READ";
+        private int fallbackCapacity = 16;
+        private long fallbackTtlMillis = 30_000;
 
         public long getTimeoutMillis() { return timeoutMillis; }
         public void setTimeoutMillis(long v) { this.timeoutMillis = v; }
@@ -44,5 +46,9 @@ public class ResilienceProperties {
         public void setHalfOpenPermits(int v) { this.halfOpenPermits = v; }
         public String getOperationKind() { return operationKind; }
         public void setOperationKind(String v) { this.operationKind = v; }
+        public int getFallbackCapacity() { return fallbackCapacity; }
+        public void setFallbackCapacity(int v) { this.fallbackCapacity = v; }
+        public long getFallbackTtlMillis() { return fallbackTtlMillis; }
+        public void setFallbackTtlMillis(long v) { this.fallbackTtlMillis = v; }
     }
 }

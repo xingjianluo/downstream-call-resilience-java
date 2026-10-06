@@ -48,6 +48,30 @@ public class CircuitBreaker {
     }
 
     /**
+     * 只读：当前连续失败计数（HALF_OPEN 下记已失败的探测数）。
+     */
+    public synchronized int consecutiveFailures() {
+        if (state instanceof Closed closed) {
+            return closed.failures();
+        }
+        if (state instanceof HalfOpen half) {
+            return half.failed();
+        }
+        return 0;
+    }
+
+    /**
+     * 只读：OPEN 状态下距半开探测的剩余毫秒；非 OPEN 返回 0。
+     */
+    public synchronized long recoverInMillis() {
+        if (state instanceof Open open) {
+            return Math.max(0, policy.openStateDuration().toMillis()
+                    - (clock.millis() - open.openedAt()));
+        }
+        return 0;
+    }
+
+    /**
      * 尝试获取调用许可。
      *
      * @return 许可；OPEN（未到探测时机）或 HALF_OPEN 名额已满时返回 {@code null}，调用方应快速失败
