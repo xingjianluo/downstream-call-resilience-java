@@ -1,24 +1,30 @@
 package com.github.xingjianluo.downstreamcallresiliencejava.web;
 
+import com.github.xingjianluo.downstreamcallresiliencejava.fallback.FallbackCacheRegistry;
+import com.github.xingjianluo.downstreamcallresiliencejava.fallback.FallbackCacheStats;
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.DownstreamRequest;
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.DownstreamResponse;
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.MockDownstreamServer;
 import com.github.xingjianluo.downstreamcallresiliencejava.orchestration.AggregatedResponse;
 import com.github.xingjianluo.downstreamcallresiliencejava.orchestration.Orchestrator;
 import com.github.xingjianluo.downstreamcallresiliencejava.orchestration.PartSpec;
+import com.github.xingjianluo.downstreamcallresiliencejava.resilience.CircuitBreakerRegistry;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 演示用对外接口。
  * <p>既有接口契约保持不变，仅新增路径：
  * <ul>
  *   <li>GET  /api/resilience/aggregate：并发编排三个下游，返回（可能带降级的）聚合结果；</li>
+ *   <li>GET  /api/resilience/status：只读查询各下游熔断状态与回退缓存占用；</li>
  *   <li>POST /api/resilience/demo/reset：重置模拟下游脚本，便于本地反复复现。</li>
  * </ul>
  */
@@ -32,10 +38,15 @@ public class DemoController {
 
     private final Orchestrator orchestrator;
     private final MockDownstreamServer server;
+    private final CircuitBreakerRegistry breakers;
+    private final FallbackCacheRegistry fallbackCaches;
 
-    public DemoController(Orchestrator orchestrator, MockDownstreamServer server) {
+    public DemoController(Orchestrator orchestrator, MockDownstreamServer server,
+                          CircuitBreakerRegistry breakers, FallbackCacheRegistry fallbackCaches) {
         this.orchestrator = orchestrator;
         this.server = server;
+        this.breakers = breakers;
+        this.fallbackCaches = fallbackCaches;
         installScripts();
     }
 
@@ -60,6 +71,34 @@ public class DemoController {
                 new PartSpec(WRITER, new DownstreamRequest("idem-demo-001", "create-order"),
                         () -> "order-uncertain"));
         return orchestrator.aggregate(parts, Duration.ofMillis(1500));
+    }
+
+    /**
+     * 只读查询入口：各下游当前熔断状态与回退缓存占用，便于本地复现与排查。
+     */
+    @GetMapping("/status")
+    public Map<String, DownstreamStatus> status() {
+        Map<String, String> circuits = breakers.snapshots();
+        Map<String, FallbackCacheStats> caches = fallbackCaches.stats();
+        Map<String, DownstreamStatus> result = new LinkedHashMap<>();
+        circuits.forEach((name, circuit) -> {
+            FallbackCacheStats cache = caches.get(name);
+            result.put(name, new DownstreamStatus(circuit,
+                    cache == null ? 0 : cache.size(),
+                    cache == null ? 0 : cache.capacity(),
+                    cache == null ? 0 : cache.ttlMillis()));
+        });
+        caches.forEach((name, cache) ->
+                result.putIfAbsent(name, new DownstreamStatus("(尚未发起调用)",
+                        cache.size(), cache.capacity(), cache.ttlMillis())));
+        return result;
+    }
+
+    /**
+     * 单个下游的只读状态视图：熔断快照 + 回退缓存占用。
+     */
+    public record DownstreamStatus(String circuit, int fallbackSize,
+                                   int fallbackCapacity, long fallbackTtlMillis) {
     }
 
     @PostMapping("/demo/reset")

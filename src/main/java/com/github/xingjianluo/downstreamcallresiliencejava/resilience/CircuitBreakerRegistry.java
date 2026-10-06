@@ -23,4 +23,13 @@ public class CircuitBreakerRegistry {
         return breakers.computeIfAbsent(downstreamName,
                 name -> new CircuitBreaker(name, policyProvider.policyFor(name), clock));
     }
+
+    /**
+     * 各下游熔断器状态快照（只读，供查询入口展示健康/熔断状态）。
+     */
+    public java.util.Map<String, String> snapshots() {
+        java.util.Map<String, String> result = new java.util.LinkedHashMap<>();
+        breakers.forEach((name, breaker) -> result.put(name, breaker.snapshot()));
+        return result;
+    }
 }

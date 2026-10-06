@@ -1,5 +1,7 @@
 package com.github.xingjianluo.downstreamcallresiliencejava.config;
 
+import com.github.xingjianluo.downstreamcallresiliencejava.fallback.FallbackCacheRegistry;
+import com.github.xingjianluo.downstreamcallresiliencejava.fallback.FallbackPolicy;
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.DownstreamTransport;
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.MockDownstreamServer;
 import com.github.xingjianluo.downstreamcallresiliencejava.orchestration.Orchestrator;
@@ -73,7 +75,20 @@ public class ResilienceConfig {
     }
 
     @Bean
-    public Orchestrator orchestrator(ResilienceClient client, DownstreamTransport transport) {
-        return new Orchestrator(client, transport);
+    public Orchestrator orchestrator(ResilienceClient client, DownstreamTransport transport,
+                                     FallbackCacheRegistry fallbackCaches, FailureRules rules) {
+        return new Orchestrator(client, transport, fallbackCaches, rules);
+    }
+
+    @Bean
+    public FallbackCacheRegistry fallbackCacheRegistry(ResilienceProperties props, Clock clock) {
+        return new FallbackCacheRegistry(name -> {
+            ResilienceProperties.DownstreamProps p = props.getDownstreams().get(name);
+            if (p == null) {
+                return FallbackPolicy.defaults();
+            }
+            return new FallbackPolicy(Math.max(1, p.getFallbackCapacity()),
+                    Duration.ofMillis(p.getFallbackTtlMillis()));
+        }, clock);
     }
 }

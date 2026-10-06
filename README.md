@@ -15,6 +15,11 @@
 | 熔断并发安全：半开有限探测、按下游隔离、计数不重不漏 | `resilience/CircuitBreaker`、`CircuitBreakerRegistry` |
 | 请求级降级与部分结果，标明缺失与原因 | `orchestration/Orchestrator`、`PartResult`、`AggregatedResponse` |
 | 重试与降级对同一副作用判定一致 | `FailureRules#decideRetry` 与 `#isSideEffectAmbiguous` 共用一份规则 |
+| 读失败优先回退最近一次成功结果（标注旧数据与新鲜度） | `fallback/FallbackCache`、`Orchestrator#fallbackPart` |
+| 回退数据容量上限 + 有效期 + LRU 淘汰，O(1) 查找/淘汰 | `fallback/FallbackCache`、`FallbackPolicy` |
+| 写操作绝不回退旧数据（与禁重试同一份判定） | `FailureRules#isStaleFallbackAllowed` |
+| 分片标注取值来源（实时/旧数据回退/静态兜底） | `orchestration/PartSource`、`PartResult#source/ageMillis` |
+| 只读查询各下游熔断状态与回退缓存占用 | `GET /api/resilience/status`、`CircuitBreakerRegistry#snapshots`、`FallbackCacheRegistry#stats` |
 | 本地模拟延迟/故障/重复响应 | `mock/MockDownstreamServer`（脚本行为 + 每键串行化去重表） |
 
 ## 2. 策略配置
@@ -29,6 +34,8 @@ resilience.downstreams.<下游名>.failure-threshold=5       # 连续失败熔�
 resilience.downstreams.<下游名>.open-state-millis=2000    # OPEN 持续时长，到期进入半开
 resilience.downstreams.<下游名>.half-open-permits=1       # 半开探测名额
 resilience.downstreams.<下游名>.operation-kind=READ       # READ / IDEMPOTENT_WRITE / NON_IDEMPOTENT_WRITE
+resilience.downstreams.<下游名>.fallback-capacity=64      # 回退缓存条数上限（默认 64）
+resilience.downstreams.<下游名>.fallback-ttl-millis=60000 # 回退数据有效期（默认 60s）
 ```
 
 ### 操作语义（operation-kind）
@@ -79,13 +86,49 @@ HALF_OPEN ──任一探测失败──▶ OPEN（重置打开计时）
 
 1. 各分片在虚拟线程上并发调用（每个分片内部仍受该下游自己的超时/重试/熔断保护）；
 2. 整体时限到期时，未完成分片直接按 `TIMEOUT` 降级，响应仍在时限内返回；
-3. 每个失败分片回填降级值，`PartResult` 标注 `present/degraded/category/attempts/reason`；
+3. 每个失败分片先尝试旧数据回退（见第 6 节），不可用时才回填静态缺省值，
+   `PartResult` 标注 `present/degraded/category/attempts/reason`，
+   并用 `source`（`LIVE` / `STALE_FALLBACK` / `STATIC_FALLBACK`）标明取值来源、
+   用 `ageMillis` 标明旧数据新鲜度（仅旧数据回退时有值）；
 4. `AggregatedResponse` 汇总 `complete`、`missing`（含下游名、类别、原因）与耗时。
 
-## 6. 验证方法
+## 6. 旧数据回退（Fallback Cache）
+
+读操作失败要走降级时，优先回退该下游**最近一次成功的结果**，并在分片里标清
+`source=STALE_FALLBACK` 与 `ageMillis`（数据距成功写入的时长）。满足以下任一条件时
+才退回原来的静态缺省值（`source=STATIC_FALLBACK`）：
+
+- 该下游从未成功过（缓存未命中）；
+- 旧数据已超过有效期（`fallback-ttl-millis`，到期即不可回退）；
+- 该操作不适合回退旧数据：所有写操作（`IDEMPOTENT_WRITE` / `NON_IDEMPOTENT_WRITE`）
+  绝不回退旧数据。该判定由 `FailureRules#isStaleFallbackAllowed` 给出，
+  与 `decideRetry` 的禁重试、`isSideEffectAmbiguous` 的副作用未知判定共用同一份规则——
+  不会出现"一边判定不能重发、另一边却把旧结果当成功返回"的矛盾。
+
+回退缓存的约束（`fallback/FallbackCache`，按下游隔离）：
+
+- **只缓存成功结果**：写入只发生在成功路径，失败结果绝不进缓存；
+- **容量上限 + 明确淘汰规则**：超过 `fallback-capacity` 按"最久未使用（LRU）"淘汰；
+- **有效期**：命中前检查 TTL，过期条目顺手移除，不再占用容量；
+- **常数级开销**：访问序 `LinkedHashMap`，查找/写入/淘汰均摊 O(1)，不会拖过整体时限；
+- **并发安全**：所有读写在同一把锁上串行化，任何时刻 `size` 与内容严格一致；
+  回退查找只是读缓存，**绝不会因此把下游再打一次**；
+- 整体时限截断（TIMEOUT）的读分片同样走同一出口，可回退旧数据。
+
+### 只读状态查询入口
+
+```
+GET /api/resilience/status
+```
+
+返回每个下游的熔断快照（`circuit`）与回退缓存占用
+（`fallbackSize` / `fallbackCapacity` / `fallbackTtlMillis`），便于本地复现与排查。
+该入口只读，不改变任何状态；某下游尚未发生可缓存的读成功时，其缓存不创建，占用显示为 0。
+
+## 7. 验证方法
 
 ```bash
-# 全部 23 个单测（含 Spring 上下文装载）
+# 全部 37 个单测（含 Spring 上下文装载）
 mvn test
 
 # 按场景单独运行
@@ -93,6 +136,15 @@ mvn test -Dtest=CircuitBreakerTest,CircuitHalfOpenTest,CircuitConcurrencyTest  #
 mvn test -Dtest=RetryAndTimeoutTest                                            # 超时/重试/分类
 mvn test -Dtest=DuplicateWriteTest                                             # 重复写/幂等去重
 mvn test -Dtest=OrchestrationDegradeTest                                       # 降级/部分结果/整体时限
+mvn test -Dtest=FallbackCacheTest                                              # 回退缓存容量/过期/并发
+mvn test -Dtest=StaleFallbackOrchestrationTest                                 # 旧数据回退/来源标注/写不回退
+```
+
+测试日志会打印**每个分片本次是实时、旧数据回退还是静态兜底及判定依据**，例如：
+
+```
+[reader] 编排分片结果=降级 来源=旧数据回退 类别=DOWNSTREAM_ERROR 尝试次数=1 数据年龄=5000ms 判定依据=…；回退到 5000ms 前的最近一次成功结果
+[writer] 操作类型=NON_IDEMPOTENT_WRITE 不适合回退旧数据（与禁重试判定一致），改用静态兜底
 ```
 
 测试日志（控制台 + `target/surefire-reports`）会打印**每个下游的调用结果与判定依据**。
@@ -106,9 +158,23 @@ curl -s http://localhost:<port>/api/resilience/aggregate
 # 随后请求返回 CIRCUIT_OPEN 快速失败（~20ms），其余两个下游始终完整；
 # order-write-service 携带幂等键 idem-demo-001，重复调用返回 duplicate=true 且写只执行一次。
 curl -s -X POST http://localhost:<port>/api/resilience/demo/reset   # 重置模拟脚本
+curl -s http://localhost:<port>/api/resilience/status
+# 各下游熔断状态 + 回退缓存占用，例如：
+# profile-service:  CLOSED, fallbackSize=1/64（读成功已缓存，供故障时回退）
+# inventory-service: OPEN,  fallbackSize=0/64（从未成功过，只能静态兜底）
+# order-write-service: CLOSED, fallbackSize=0（写操作不进回退缓存）
 ```
 
-## 7. 测试场景覆盖一览
+### 兼容范围（与之前行为一致的部分）
+
+- 对外接口契约不变：`/api/resilience/aggregate`、`/demo/reset` 语义不变，仅新增 `GET /status`；
+- `AggregatedResponse` 的 `complete` / `degraded` / `missing` 语义不变：任何降级分片
+  （无论旧数据回退还是静态兜底）仍计为 `present=false` 并出现在 `missing` 中；
+- 整体时限语义不变：回退查找为 O(1) 缓存读取，不会把整体响应拖过约定时限；
+- 超时/重试/熔断判定不变：旧数据回退只发生在重试与熔断判定完成之后；
+- `PartResult` 保留旧构造器，未启用回退缓存时（两参 `Orchestrator` 构造）行为与之前完全一致。
+
+## 8. 测试场景覆盖一览
 
 | 测试类 | 覆盖点 |
 | --- | --- |
@@ -118,8 +184,10 @@ curl -s -X POST http://localhost:<port>/api/resilience/demo/reset   # 重置模�
 | `RetryAndTimeoutTest` | 连接失败/下游错误/真实超时分类、重试次数准确、非幂等写超时不重试、已确认写不重试 |
 | `DuplicateWriteTest` | 迟到确认+重试只写一次、同键重复响应回放、32 并发同键只写一次、无键非幂等不享受保护 |
 | `OrchestrationDegradeTest` | 部分结果按时返回、缺失标注与降级值、整体时限截断慢下游、写降级副作用判定一致 |
+| `FallbackCacheTest` | 容量上限与 LRU 淘汰、TTL 边界（到期即不可回退）、同键覆盖、计数与内容一致、32 线程并发不突破容量 |
+| `StaleFallbackOrchestrationTest` | 读失败回退旧数据并标注新鲜度、从未成功/过期走静态兜底、写操作绝不回退旧数据、整体时限截断也回退、24 并发不打两次下游且失败不入缓存、旧语义不变 |
 
-## 8. 主要代码结构
+## 9. 主要代码结构
 
 ```
 resilience/   FailureCategory / CircuitState / OperationKind / RetryDecision
@@ -129,7 +197,11 @@ resilience/   FailureCategory / CircuitState / OperationKind / RetryDecision
               CircuitBreakerRegistry  按下游隔离
               ResilienceClient        超时(Future 限时) + 重试 + 熔断的整合执行
 mock/         MockDownstreamServer    脚本编排延迟/故障 + 幂等键去重(每键串行化)
-orchestration/Orchestrator            并发编排 + 整体时限 + 降级部分结果
+fallback/     FallbackCache           单下游回退缓存（LRU 容量 + TTL，O(1)，锁内一致）
+              FallbackCacheRegistry   按下游隔离的回退缓存注册表 + 占用快照
+              FallbackPolicy/CachedFallback/FallbackCacheStats  策略/命中结果/占用快照
+orchestration/Orchestrator            并发编排 + 整体时限 + 旧数据回退/静态兜底
+              PartSource              分片取值来源：LIVE / STALE_FALLBACK / STATIC_FALLBACK
 config/       ResilienceConfig/Properties  Bean 装配与配置绑定
 web/          DemoController          /api/resilience/aggregate 演示端点
 ```

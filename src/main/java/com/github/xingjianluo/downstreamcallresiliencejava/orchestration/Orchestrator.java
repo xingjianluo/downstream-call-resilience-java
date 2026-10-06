@@ -1,10 +1,14 @@
 package com.github.xingjianluo.downstreamcallresiliencejava.orchestration;
 
+import com.github.xingjianluo.downstreamcallresiliencejava.fallback.CachedFallback;
+import com.github.xingjianluo.downstreamcallresiliencejava.fallback.FallbackCacheRegistry;
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.DownstreamRequest;
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.DownstreamResponse;
 import com.github.xingjianluo.downstreamcallresiliencejava.mock.DownstreamTransport;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.CallOutcome;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.FailureCategory;
+import com.github.xingjianluo.downstreamcallresiliencejava.resilience.FailureRules;
+import com.github.xingjianluo.downstreamcallresiliencejava.resilience.OperationKind;
 import com.github.xingjianluo.downstreamcallresiliencejava.resilience.ResilienceClient;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,8 +27,10 @@ import java.util.concurrent.TimeoutException;
  * 多下游调用编排。
  * <ul>
  *   <li>各下游并发调用；即使某个下游不可用，整体响应也在约定时限内返回；</li>
- *   <li>某分片失败时执行其降级供应，{@link PartResult} 明确标注缺失分片与原因，
- *       降级判定（副作用是否未知）与重试判定共用 {@code FailureRules} 同一份规则；</li>
+ *   <li>读操作失败时优先回退该下游最近一次成功的结果（标注旧数据与新鲜度），
+ *       无可用旧数据或操作不适合回退时才用静态缺省值；写操作绝不回退旧数据，
+ *       该判定与重试判定共用 {@link FailureRules} 同一份规则；</li>
+ *   <li>每个分片标注取值来源（{@link PartSource}）与原因，缺失分片语义不变；</li>
  *   <li>整体时限到期时仍未结束的分片记为降级（类别 TIMEOUT），不拖垮整体响应。</li>
  * </ul>
  */
@@ -34,12 +40,24 @@ public class Orchestrator {
 
     private final ResilienceClient client;
     private final DownstreamTransport transport;
+    private final FallbackCacheRegistry fallbackCaches; // 为 null 表示未启用旧数据回退
+    private final FailureRules rules;
     private final ExecutorService executor =
             Executors.newThreadPerTaskExecutor(Thread.ofVirtual().name("orchestration-", 0).factory());
 
+    /**
+     * 兼容旧用法：不启用旧数据回退，降级行为与之前完全一致（静态缺省值）。
+     */
     public Orchestrator(ResilienceClient client, DownstreamTransport transport) {
+        this(client, transport, null, new FailureRules());
+    }
+
+    public Orchestrator(ResilienceClient client, DownstreamTransport transport,
+                        FallbackCacheRegistry fallbackCaches, FailureRules rules) {
         this.client = client;
         this.transport = transport;
+        this.fallbackCaches = fallbackCaches;
+        this.rules = rules;
     }
 
     public AggregatedResponse aggregate(List<PartSpec> parts, Duration overallDeadline) {
@@ -83,15 +101,55 @@ public class Orchestrator {
         CallOutcome<DownstreamResponse> outcome = client.execute(name,
                 () -> transport.invoke(name, request));
         if (outcome.success()) {
-            log.info("[{}] 编排分片结果=完整 类别=SUCCESS 尝试次数={}", name, outcome.attempts());
+            cacheSuccessIfAllowed(spec, outcome.value().body());
+            log.info("[{}] 编排分片结果=完整 来源=实时 类别=SUCCESS 尝试次数={}", name, outcome.attempts());
             return new PartResult(name, true, false, FailureCategory.SUCCESS,
-                    outcome.attempts(), outcome.value().body(), "OK");
+                    outcome.attempts(), outcome.value().body(), "OK",
+                    PartSource.LIVE, null);
         }
         return degrade(spec, outcome);
     }
 
+    /**
+     * 成功结果写入回退缓存：仅当启用回退且该操作允许旧数据回退（只读）时写入；
+     * 失败结果绝不进入缓存。
+     */
+    private void cacheSuccessIfAllowed(PartSpec spec, String body) {
+        if (fallbackCaches == null) {
+            return;
+        }
+        OperationKind kind = client.policyOf(spec.downstreamName()).operationKind();
+        if (rules.isStaleFallbackAllowed(kind)) {
+            fallbackCaches.get(spec.downstreamName()).put(spec.request(), body);
+        }
+    }
+
     private PartResult degrade(PartSpec spec, CallOutcome<DownstreamResponse> outcome) {
+        return fallbackPart(spec, outcome.category(), outcome.attempts(), outcome.reason());
+    }
+
+    /**
+     * 统一的降级出口：读操作优先回退旧数据（标注新鲜度），否则静态缺省值。
+     * 写操作（尤其结果不确定的非幂等写）绝不回退旧数据——与重试判定同一份规则。
+     */
+    private PartResult fallbackPart(PartSpec spec, FailureCategory category, int attempts, String reason) {
         String name = spec.downstreamName();
+        if (fallbackCaches != null) {
+            OperationKind kind = client.policyOf(name).operationKind();
+            if (rules.isStaleFallbackAllowed(kind)) {
+                CachedFallback cached = fallbackCaches.get(name).get(spec.request());
+                if (cached != null) {
+                    String detail = reason + "；回退到 " + cached.ageMillis() + "ms 前的最近一次成功结果";
+                    log.info("[{}] 编排分片结果=降级 来源=旧数据回退 类别={} 尝试次数={} 数据年龄={}ms 判定依据={}",
+                            name, category, attempts, cached.ageMillis(), detail);
+                    return new PartResult(name, false, true, category, attempts,
+                            cached.value(), detail, PartSource.STALE_FALLBACK, cached.ageMillis());
+                }
+                log.info("[{}] 旧数据回退不可用（从未成功过或已过期），改用静态兜底", name);
+            } else {
+                log.info("[{}] 操作类型={} 不适合回退旧数据（与禁重试判定一致），改用静态兜底", name, kind);
+            }
+        }
         String fallbackValue = null;
         if (spec.fallback() != null) {
             try {
@@ -100,11 +158,10 @@ public class Orchestrator {
                 log.warn("[{}] 降级供应自身失败: {}", name, e.toString());
             }
         }
-        PartResult result = new PartResult(name, false, true, outcome.category(),
-                outcome.attempts(), fallbackValue, outcome.reason());
-        log.info("[{}] 编排分片结果=降级缺失 类别={} 尝试次数={} 判定依据={} 降级值={}",
-                name, outcome.category(), outcome.attempts(), outcome.reason(), fallbackValue);
-        return result;
+        log.info("[{}] 编排分片结果=降级 来源=静态兜底 类别={} 尝试次数={} 判定依据={} 降级值={}",
+                name, category, attempts, reason, fallbackValue);
+        return new PartResult(name, false, true, category, attempts,
+                fallbackValue, reason, PartSource.STATIC_FALLBACK, null);
     }
 
     private PartResult collect(PartSpec spec, CompletableFuture<PartResult> future, long remainingNanos) {
@@ -119,22 +176,16 @@ public class Orchestrator {
             return timedOutPart(spec);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return new PartResult(spec.downstreamName(), false, true, FailureCategory.REJECTED,
-                    0, fallbackOf(spec), "编排等待被中断");
+            return fallbackPart(spec, FailureCategory.REJECTED, 0, "编排等待被中断");
         } catch (ExecutionException e) {
-            return new PartResult(spec.downstreamName(), false, true, FailureCategory.DOWNSTREAM_ERROR,
-                    0, fallbackOf(spec), "分片执行异常: " + e.getCause());
+            return fallbackPart(spec, FailureCategory.DOWNSTREAM_ERROR, 0,
+                    "分片执行异常: " + e.getCause());
         }
     }
 
     private PartResult timedOutPart(PartSpec spec) {
-        log.info("[{}] 编排分片结果=降级缺失 类别=TIMEOUT 依据=超过整体时限，未等待该分片",
+        log.info("[{}] 编排分片结果=降级 类别=TIMEOUT 依据=超过整体时限，未等待该分片",
                 spec.downstreamName());
-        return new PartResult(spec.downstreamName(), false, true, FailureCategory.TIMEOUT,
-                0, fallbackOf(spec), "超过整体时限，按降级返回部分结果");
-    }
-
-    private String fallbackOf(PartSpec spec) {
-        return spec.fallback() == null ? null : spec.fallback().get();
+        return fallbackPart(spec, FailureCategory.TIMEOUT, 0, "超过整体时限，按降级返回部分结果");
     }
 }

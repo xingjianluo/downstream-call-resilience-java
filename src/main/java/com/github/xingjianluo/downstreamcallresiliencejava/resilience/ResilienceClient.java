@@ -42,6 +42,13 @@ public class ResilienceClient {
         this.executor = executor;
     }
 
+    /**
+     * 查看某下游当前生效的策略（只读；编排层据此判断操作类型以决定降级方式）。
+     */
+    public ResiliencePolicy policyOf(String downstreamName) {
+        return registry.get(downstreamName).policy();
+    }
+
     public <T> CallOutcome<T> execute(String downstreamName, DownstreamCall<T> call) {
         CircuitBreaker breaker = registry.get(downstreamName);
         ResiliencePolicy policy = breaker.policy();

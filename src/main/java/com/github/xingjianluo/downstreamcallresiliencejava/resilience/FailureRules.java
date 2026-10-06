@@ -62,6 +62,18 @@ public final class FailureRules {
     }
 
     /**
+     * 旧数据回退是否允许：仅只读操作允许拿"最近一次成功结果"当降级返回。
+     * <p>写操作（无论是否幂等）绝不允许把旧结果当成功返回——尤其是
+     * {@link OperationKind#NON_IDEMPOTENT_WRITE} 结果不确定时，
+     * 与 {@link #decideRetry} 的禁止重试、{@link #isSideEffectAmbiguous} 的
+     * 副作用未知判定保持一致：同一份规则，不会出现"一边判定不能重发、
+     * 另一边却把旧结果当成功返回"的矛盾。
+     */
+    public boolean isStaleFallbackAllowed(OperationKind kind) {
+        return kind == OperationKind.READ;
+    }
+
+    /**
      * 降级路径使用同一判定：该失败是否意味着副作用状态未知。
      * <p>仅当"非幂等写 + 超时/下游错误 + 未被确认"时副作用未知；
      * 与 {@link #decideRetry} 的禁止重试结论保持一致。
